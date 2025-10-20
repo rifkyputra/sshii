@@ -68,15 +68,20 @@ if (( $# > 0 )); then
   done
 fi
 
-# Must be inside a git repo
+# Detect if inside a git repo. Allow running outside of one.
+IN_GIT_REPO=1
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "❌ Not inside a Git repository."
-  exit 1
+  IN_GIT_REPO=0
+  echo "⚠️  Not inside a Git repository. The script will run, but will not modify git config."
 fi
 
 if (( DO_UNSET )); then
-  git config --unset core.sshCommand 2>/dev/null || true
-  echo "✅ Unset core.sshCommand for this repo."
+  if (( IN_GIT_REPO )); then
+    git config --unset core.sshCommand 2>/dev/null || true
+    echo "✅ Unset core.sshCommand for this repo."
+  else
+    echo "⚠️  Cannot unset core.sshCommand because this is not a Git repository."
+  fi
   exit 0
 fi
 
@@ -305,8 +310,12 @@ if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
   
 
 # Set the repo to use this key (keep ~/.ssh/config honored; do NOT add -F /dev/null)
-git config core.sshCommand "ssh -i $SELECTED"
-echo "✅ core.sshCommand set to use key: $SELECTED"
+if (( IN_GIT_REPO )); then
+  git config core.sshCommand "ssh -i $SELECTED"
+  echo "✅ core.sshCommand set to use key: $SELECTED"
+else
+  echo "ℹ️  Not in a Git repo; skipped setting core.sshCommand. Selected key: $SELECTED"
+fi
 SELECTED_PATH="$SELECTED"
 
 # Optionally clear all identities from the ssh-agent (ssh-add -D)

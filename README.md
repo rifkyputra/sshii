@@ -1,8 +1,6 @@
 # sshii
 
-A small repository that contains an executable named `sshii` and a `Makefile` to install it into your user local bin directory.
-
-This README was generated from the repository layout and the `Makefile` targets. I inferred the role of the `sshii` file as a small CLI executable — run `sshii --help` after installing to see available options.
+A small repository that contains `sshii` script. manage your ssh config with ease.
 
 ## Installation
 
@@ -45,6 +43,24 @@ sshii
 ```
 
 If `sshii` is a script that requires additional setup (config files, environment variables, etc.), consult any project-specific docs or check the script header/comments.
+
+## Running inside vs outside a Git repository
+
+The `sshii` script can be used both from inside a Git repository and from any other directory. Behavior differs slightly:
+
+### Inside a Git repository:
+
+The script will allow you to select an SSH private key or an SSH config Host and will set the repository-local Git configuration `core.sshCommand` to use the selected key (so Git operations from that repo will use the chosen key).
+  
+The `--unset` option will unset `core.sshCommand` for the repo.
+
+### Outside a Git repository:
+
+The script will still list SSH keys and allow selection, and will perform agent-related actions (like clearing identities) as requested.
+
+The script will not attempt to modify any Git configuration. `--unset` will print a message explaining it cannot unset `core.sshCommand` because you are not in a repository.
+
+This makes `sshii` safe to run for inspecting keys or editing your `~/.ssh/config` even when you're not working inside a Git project.
 
 ## Development
 
