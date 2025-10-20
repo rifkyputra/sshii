@@ -6,6 +6,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [--unset] [--test]
   --unset   Unset core.sshCommand for this repo
+  --clear  Clear all identities from ssh-agent after selecting key (runs `ssh-add -D`)
   --test    After setting, run a quick connection test to origin
   --append-config  Interactively add a new Host entry to ~/.ssh/config
   --remove-host    Interactively remove a Host entry from ~/.ssh/config
@@ -19,6 +20,36 @@ DO_UNSET=0
 DO_TEST=0
 DO_APPEND=0
 DO_REMOVE=0
+# Clear identities option (can be enabled via --clear-identities or SSHII_CLEAR_IDENTITIES=1)
+DO_CLEAR=0
+# Color handling: default is auto (enable when stdout is a TTY)
+DO_COLOR=2 # 0 = no, 1 = yes, 2 = auto
+
+# ANSI color codes (only used when colors enabled)
+_color_init() {
+  if [[ $DO_COLOR -eq 2 ]]; then
+    if [[ -t 1 ]]; then
+      DO_COLOR=1
+    else
+      DO_COLOR=0
+    fi
+  fi
+  if (( DO_COLOR )); then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    RESET='\033[0m'
+  else
+    RED='' ; GREEN='' ; YELLOW='' ; BLUE='' ; BOLD='' ; RESET=''
+  fi
+}
+
+# Helper to print status messages with optional color and emoji fallback
+status_ok()  { printf "%b%s%b\n" "$GREEN" "$1" "$RESET"; }
+status_err() { printf "%b%s%b\n" "$RED" "$1" "$RESET"; }
+status_info(){ printf "%b%s%b\n" "$BLUE" "$1" "$RESET"; }
 
 # Parse args ONLY if there are any; ignore empty/blank args
 if (( $# > 0 )); then
@@ -28,6 +59,7 @@ if (( $# > 0 )); then
     case "$arg" in
       --unset) DO_UNSET=1 ;;
       --test)  DO_TEST=1 ;;
+        --clear) DO_CLEAR=1 ;;
       --append-config) DO_APPEND=1 ;;
       --remove-host) DO_REMOVE=1 ;;
       -h|--help) usage; exit 0 ;;
@@ -260,11 +292,41 @@ fi
 # Expand leading ~ for the selected key and validate
 SELECTED="${SELECTED/#\~/$HOME}"
 [[ -f "$SELECTED" ]] || { echo "❌ Key not found: $SELECTED"; exit 1; }
+if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+      echo "ℹ️  Clearing identities from ssh-agent..."
+      if ssh-add -D 2>/dev/null; then
+        echo "✅ Cleared identities from ssh-agent."
+      else
+        echo "⚠️  ssh-add -D failed (agent may not accept commands)."
+      fi
+    else
+      echo "⚠️  SSH_AUTH_SOCK not set; no ssh-agent detected. Skipping ssh-add -D."
+    fi
+  
 
 # Set the repo to use this key (keep ~/.ssh/config honored; do NOT add -F /dev/null)
 git config core.sshCommand "ssh -i $SELECTED"
 echo "✅ core.sshCommand set to use key: $SELECTED"
 SELECTED_PATH="$SELECTED"
+
+# Optionally clear all identities from the ssh-agent (ssh-add -D)
+if (( DO_CLEAR )); then
+  if command -v ssh-add >/dev/null 2>&1; then
+    # Only attempt if an ssh-agent seems present (SSH_AUTH_SOCK)
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+      echo "ℹ️  Clearing identities from ssh-agent..."
+      if ssh-add -D 2>/dev/null; then
+        echo "✅ Cleared identities from ssh-agent."
+      else
+        echo "⚠️  ssh-add -D failed (agent may not accept commands)."
+      fi
+    else
+      echo "⚠️  SSH_AUTH_SOCK not set; no ssh-agent detected. Skipping ssh-add -D."
+    fi
+  else
+    echo "⚠️  ssh-add not found in PATH; cannot clear identities."
+  fi
+fi
 
 if (( DO_TEST )); then
   echo
