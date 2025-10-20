@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG="${HOME}/.ssh/config"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--unset] [--test]
+  --unset   Unset core.sshCommand for this repo
+  --test    After setting, run a quick connection test to origin
+  --append-config  Interactively add a new Host entry to ~/.ssh/config
+  --remove-host    Interactively remove a Host entry from ~/.ssh/config
+  The script now lists both SSH keys (IdentityFile) and SSH config Host entries
+  so you can choose either a specific private key or an SSH Host from
+  ~/.ssh/config. Choosing a Host will set git to use the SSH config (ssh -F).
+EOF
+}
+
+DO_UNSET=0
+DO_TEST=0
+DO_APPEND=0
+DO_REMOVE=0
+
+# Parse args ONLY if there are any; ignore empty/blank args
+if (( $# > 0 )); then
+  for arg in "$@"; do
+    # Skip empty args defensively
+    [[ -z "${arg}" ]] && continue
+    case "$arg" in
+      --unset) DO_UNSET=1 ;;
+      --test)  DO_TEST=1 ;;
+      --append-config) DO_APPEND=1 ;;
+      --remove-host) DO_REMOVE=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "Unknown option: $arg"; usage; exit 1 ;;
+    esac
+  done
+fi
+
+# Must be inside a git repo
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "❌ Not inside a Git repository."
+  exit 1
+fi
+
+if (( DO_UNSET )); then
+  git config --unset core.sshCommand 2>/dev/null || true
+  echo "✅ Unset core.sshCommand for this repo."
+  exit 0
+fi
+
+# Collect keys from ~/.ssh/config (IdentityFile) or fallback to ~/.ssh/id_*
+declare -a KEYS=()
+declare -a HOSTS=()
+declare -A HOST_ID=()
+if [[ -f "$CONFIG" ]]; then
+  mapfile -t KEYS < <(awk '/^Host[[:space:]]+/ {h=$2}
+                           /^[[:space:]]*IdentityFile[[:space:]]+/ {print $2}' \
+                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sort -u)
+  # Collect Host entries (skip wildcard-only entries like "Host *")
+  # Also build a Host -> IdentityFile mapping (first IdentityFile found per Host)
+  # We'll use awk to print pairs: host\tidentityfile for each IdentityFile line
+  while IFS=$'\t' read -r h f; do
+    # keep the first IdentityFile for a host (don't overwrite)
+    if [[ -n "$h" && -n "$f" && -z "${HOST_ID[$h]:-}" ]]; then
+      HOST_ID[$h]="$f"
+    fi
+  done < <(awk '/^Host[[:space:]]+/ {delete hosts; n=0; for(i=2;i<=NF;i++){gsub(/"/,"",$i); if($i!="*") {hosts[++n]=$i}}}
+                     /^[[:space:]]*IdentityFile[[:space:]]+/ { if(n>0) {gsub(/"/,"",$2); for(i=1;i<=n;i++) print hosts[i] "\t" $2 }}' "$CONFIG" 2>/dev/null | tr -d '\r')
+  mapfile -t HOSTS < <(awk '/^Host[[:space:]]+/ {for(i=2;i<=NF;i++) if($i!="*") print $i}' "$CONFIG" 2>/dev/null | sed 's|"||g' | tr -d '\r' | sort -u)
+fi
+if (( ${#KEYS[@]} == 0 )); then
+  mapfile -t KEYS < <(find "$HOME/.ssh" -maxdepth 1 -type f -name 'id_*' ! -name '*.pub' | sort)
+fi
+(( ${#KEYS[@]} )) || { echo "❌ No SSH keys found."; exit 1; }
+
+if (( DO_APPEND )); then
+  # Interactive prompts to append a Host block to ~/.ssh/config
+  read -rp "Host (short name, e.g. myserver): " NEW_HOST
+  [[ -z "${NEW_HOST// }" ]] && { echo "❌ Host cannot be empty."; exit 1; }
+  read -rp "HostName (e.g. host.example.com or IP): " NEW_HOSTNAME
+  [[ -z "${NEW_HOSTNAME// }" ]] && { echo "❌ HostName cannot be empty."; exit 1; }
+  read -rp "User (leave blank to omit): " NEW_USER
+  # Defaults
+  read -rp "AddKeysToAgent [yes/no] (default: yes): " NEW_ADDKEYS
+  NEW_ADDKEYS=${NEW_ADDKEYS:-yes}
+  case "${NEW_ADDKEYS,,}" in
+    y|yes) NEW_ADDKEYS_VAL="yes" ;;
+    n|no) NEW_ADDKEYS_VAL="no" ;;
+    *) echo "Invalid value for AddKeysToAgent. Use yes or no."; exit 1 ;;
+  esac
+  read -rp "UseKeychain [yes/no] (default: yes): " NEW_USEKEYCHAIN
+  NEW_USEKEYCHAIN=${NEW_USEKEYCHAIN:-yes}
+  case "${NEW_USEKEYCHAIN,,}" in
+    y|yes) NEW_USEKEYCHAIN_VAL="yes" ;;
+    n|no) NEW_USEKEYCHAIN_VAL="no" ;;
+    *) echo "Invalid value for UseKeychain. Use yes or no."; exit 1 ;;
+  esac
+
+  # Let user select an IdentityFile from detected keys
+  echo
+  echo "Select IdentityFile for this Host:" 
+  i=1; for k in "${KEYS[@]}"; do echo "  $i) $k"; ((i++)); done
+  read -rp "Select [1-${#KEYS[@]}] (q to cancel): " choice
+  [[ "${choice,,}" == "q" ]] && { echo "Cancelled."; exit 0; }
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#KEYS[@]} )) || { echo "❌ Invalid selection."; exit 1; }
+  SELECTED_KEY_FOR_CONFIG="${KEYS[choice-1]}"
+  SELECTED_KEY_FOR_CONFIG="${SELECTED_KEY_FOR_CONFIG/#\~/$HOME}"
+  [[ -f "${SELECTED_KEY_FOR_CONFIG}" ]] || { echo "❌ Key not found: ${SELECTED_KEY_FOR_CONFIG}"; exit 1; }
+
+  # Prepare block to append
+  BLOCK="\nHost ${NEW_HOST}\n  HostName ${NEW_HOSTNAME}\n"
+  if [[ -n "${NEW_USER// }" ]]; then
+    BLOCK+="  User ${NEW_USER}\n"
+  fi
+  BLOCK+="  IdentityFile ${SELECTED_KEY_FOR_CONFIG}\n  AddKeysToAgent ${NEW_ADDKEYS_VAL}\n  UseKeychain ${NEW_USEKEYCHAIN_VAL}\n"
+
+  # Ensure ~/.ssh exists
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  # Backup existing config if exists
+  if [[ -f "$CONFIG" ]]; then
+    cp -p "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    echo "Backup created: $CONFIG.bak.*"
+  else
+    touch "$CONFIG"
+    chmod 600 "$CONFIG"
+  fi
+
+  # Check if Host already exists (exact match on Host token)
+  if awk '/^Host[[:space:]]+/ {for(i=2;i<=NF;i++) if($i=="'"${NEW_HOST}"'" || $i=="'${NEW_HOST}'" || $i=="'${NEW_HOST}'") print $0}' "$CONFIG" | grep -q .; then
+    # Simpler check: grep for a Host line containing the token (word match)
+    if grep -E "^Host[[:space:]]+(.+\b${NEW_HOST}\b.+|${NEW_HOST})" "$CONFIG" >/dev/null 2>&1; then
+      echo "❌ Host '${NEW_HOST}' already exists in $CONFIG. Aborting to avoid duplicates.";
+      exit 1
+    fi
+  fi
+
+  # Append the block with a timestamped comment
+  TIMESTAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf "# created from sshii on %s" "$TIMESTAMP" >> "$CONFIG"
+  printf "%b\n" "$BLOCK" >> "$CONFIG"
+  chmod 600 "$CONFIG"
+  echo "✅ Appended Host '${NEW_HOST}' to $CONFIG using IdentityFile ${SELECTED_KEY_FOR_CONFIG}"
+  exit 0
+fi
+
+if (( DO_REMOVE )); then
+  if (( ${#HOSTS[@]} == 0 )); then
+    echo "❌ No Hosts found in $CONFIG to remove."; exit 1
+  fi
+  # Selection via fzf or menu
+  if command -v fzf >/dev/null 2>&1; then
+    HOST_TO_REMOVE=$(printf "%s\n" "${HOSTS[@]}" | fzf --prompt="Select Host to remove > " --height=40% --reverse)
+    [[ -z "${HOST_TO_REMOVE:-}" ]] && { echo "Cancelled."; exit 0; }
+  else
+    echo "Available SSH config Hosts:"
+    i=1; for h in "${HOSTS[@]}"; do echo "  $i) $h"; ((i++)); done
+    read -rp "Select [1-${#HOSTS[@]}] (q to cancel): " choice
+    [[ "${choice,,}" == "q" ]] && { echo "Cancelled."; exit 0; }
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#HOSTS[@]} )) || { echo "❌ Invalid selection."; exit 1; }
+    HOST_TO_REMOVE="${HOSTS[choice-1]}"
+  fi
+
+  read -rp "Are you sure you want to remove Host '${HOST_TO_REMOVE}' from $CONFIG? [y/N]: " confirm
+  [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]] && { echo "Aborted."; exit 0; }
+
+  # Backup
+  cp -p "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  echo "Backup created: $CONFIG.bak.*"
+
+  # Remove Host blocks where the Host token matches (handles multiple tokens and quoted tokens)
+  awk -v host="$HOST_TO_REMOVE" '
+    BEGIN { skip=0 }
+    /^[[:space:]]*Host[[:space:]]+/ {
+      found=0
+      for(i=2;i<=NF;i++) { token=$i; gsub(/"/,"",token); if(token==host) { found=1; break } }
+      if(found) { skip=1; next } else { skip=0 }
+    }
+    { if(!skip) print }
+  ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  echo "✅ Removed Host '${HOST_TO_REMOVE}' from $CONFIG"
+  exit 0
+fi
+
+# Collect keys from ~/.ssh/config (IdentityFile) or fallback to ~/.ssh/id_*
+declare -a KEYS=()
+declare -a HOSTS=()
+declare -A HOST_ID=()
+if [[ -f "$CONFIG" ]]; then
+  mapfile -t KEYS < <(awk '/^Host[[:space:]]+/ {h=$2}
+                           /^[[:space:]]*IdentityFile[[:space:]]+/ {print $2}' \
+                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sort -u)
+  # Collect Host entries (skip wildcard-only entries like "Host *")
+  # Also build a Host -> IdentityFile mapping (first IdentityFile found per Host)
+  # We'll use awk to print pairs: host\tidentityfile for each IdentityFile line
+  while IFS=$'\t' read -r h f; do
+    # keep the first IdentityFile for a host (don't overwrite)
+    if [[ -n "$h" && -n "$f" && -z "${HOST_ID[$h]:-}" ]]; then
+      HOST_ID[$h]="$f"
+    fi
+  done < <(awk '/^Host[[:space:]]+/ {delete hosts; n=0; for(i=2;i<=NF;i++){gsub(/"/,"",$i); if($i!="*") {hosts[++n]=$i}}}
+                     /^[[:space:]]*IdentityFile[[:space:]]+/ { if(n>0) {gsub(/"/,"",$2); for(i=1;i<=n;i++) print hosts[i] "\t" $2 }}' "$CONFIG" 2>/dev/null | tr -d '\r')
+  mapfile -t HOSTS < <(awk '/^Host[[:space:]]+/ {for(i=2;i<=NF;i++) if($i!="*") print $i}' "$CONFIG" 2>/dev/null | sed 's|"||g' | tr -d '\r' | sort -u)
+fi
+if (( ${#KEYS[@]} == 0 )); then
+  mapfile -t KEYS < <(find "$HOME/.ssh" -maxdepth 1 -type f -name 'id_*' ! -name '*.pub' | sort)
+fi
+(( ${#KEYS[@]} )) || { echo "❌ No SSH keys found."; exit 1; }
+
+
+# Prepare a display-only representation of SSH config Hosts (if any).
+HOST_DISPLAY=""
+if (( ${#HOSTS[@]} )); then
+  HOST_DISPLAY="SSH config Hosts:"
+  for h in "${HOSTS[@]}"; do
+    HOST_DISPLAY+=$'\n  - '
+    if [[ -n "${HOST_ID[$h]:-}" ]]; then
+      HOST_DISPLAY+="${h} (IdentityFile: ${HOST_ID[$h]})"
+    else
+      HOST_DISPLAY+="${h} (no IdentityFile)"
+    fi
+  done
+fi
+
+# Selection: fzf if present, otherwise numbered menu
+if command -v fzf >/dev/null 2>&1; then
+  # Show hosts as informational header, but only keys are selectable.
+  if [[ -n "${HOST_DISPLAY}" ]]; then
+    SELECTED="$(printf "%s\n" "${KEYS[@]}" | fzf --prompt="Select SSH key > " --header="$HOST_DISPLAY" --height=40% --reverse)"
+  else
+    SELECTED="$(printf "%s\n" "${KEYS[@]}" | fzf --prompt="Select SSH key > " --height=40% --reverse)"
+  fi
+  [[ -z "${SELECTED:-}" ]] && { echo "Cancelled."; exit 0; }
+else
+  # Display hosts first (informational), then present keys for selection.
+  if [[ -n "${HOST_DISPLAY}" ]]; then
+    # Print a clean, portable list of Hosts (display-only) with IdentityFile where available
+    echo "SSH config Hosts:"
+    for h in "${HOSTS[@]}"; do
+      if [[ -n "${HOST_ID[$h]:-}" ]]; then
+        echo "  - $h (IdentityFile: ${HOST_ID[$h]})"
+      else
+        echo "  - $h (no IdentityFile)"
+      fi
+    done
+    echo
+  fi
+  echo "cat ~/.ssh/config to see Host entries."
+  echo ""
+  echo "Available SSH keys:"
+  i=1; for k in "${KEYS[@]}"; do echo "  $i) $k"; ((i++)); done
+  read -rp "Select [1-${#KEYS[@]}] (q to cancel): " choice
+  [[ "${choice,,}" == "q" ]] && { echo "Cancelled."; exit 0; }
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#KEYS[@]} )) || { echo "❌ Invalid selection."; exit 1; }
+  SELECTED="${KEYS[choice-1]}"
+fi
+
+# Expand leading ~ for the selected key and validate
+SELECTED="${SELECTED/#\~/$HOME}"
+[[ -f "$SELECTED" ]] || { echo "❌ Key not found: $SELECTED"; exit 1; }
+
+# Set the repo to use this key (keep ~/.ssh/config honored; do NOT add -F /dev/null)
+git config core.sshCommand "ssh -i $SELECTED"
+echo "✅ core.sshCommand set to use key: $SELECTED"
+SELECTED_PATH="$SELECTED"
+
+if (( DO_TEST )); then
+  echo
+  echo "🧪 Testing connection to origin..."
+  GIT_SSH_COMMAND="ssh -v -i $SELECTED" git ls-remote origin 2>&1 | grep -E "Offering|Authentication succeeded" || true
+fi
