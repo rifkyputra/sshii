@@ -51,6 +51,8 @@ status_ok()  { printf "%b%s%b\n" "$GREEN" "$1" "$RESET"; }
 status_err() { printf "%b%s%b\n" "$RED" "$1" "$RESET"; }
 status_info(){ printf "%b%s%b\n" "$BLUE" "$1" "$RESET"; }
 
+_color_init
+
 # Parse args ONLY if there are any; ignore empty/blank args
 if (( $# > 0 )); then
   for arg in "$@"; do
@@ -92,7 +94,7 @@ declare -A HOST_ID=()
 if [[ -f "$CONFIG" ]]; then
   mapfile -t KEYS < <(awk '/^Host[[:space:]]+/ {h=$2}
                            /^[[:space:]]*IdentityFile[[:space:]]+/ {print $2}' \
-                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sort -u)
+                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sed "s|^~|$HOME|" | sort -u)
   # Collect Host entries (skip wildcard-only entries like "Host *")
   # Also build a Host -> IdentityFile mapping (first IdentityFile found per Host)
   # We'll use awk to print pairs: host\tidentityfile for each IdentityFile line
@@ -228,7 +230,7 @@ declare -A HOST_ID=()
 if [[ -f "$CONFIG" ]]; then
   mapfile -t KEYS < <(awk '/^Host[[:space:]]+/ {h=$2}
                            /^[[:space:]]*IdentityFile[[:space:]]+/ {print $2}' \
-                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sort -u)
+                           "$CONFIG" 2>/dev/null | sed 's|"||g' | sed "s|^~|$HOME|" | sort -u)
   # Collect Host entries (skip wildcard-only entries like "Host *")
   # Also build a Host -> IdentityFile mapping (first IdentityFile found per Host)
   # We'll use awk to print pairs: host\tidentityfile for each IdentityFile line
@@ -297,26 +299,51 @@ fi
 # Expand leading ~ for the selected key and validate
 SELECTED="${SELECTED/#\~/$HOME}"
 [[ -f "$SELECTED" ]] || { echo "❌ Key not found: $SELECTED"; exit 1; }
-if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
-      echo "ℹ️  Clearing identities from ssh-agent..."
-      if ssh-add -D 2>/dev/null; then
-        echo "✅ Cleared identities from ssh-agent."
-      else
-        echo "⚠️  ssh-add -D failed (agent may not accept commands)."
-      fi
-    else
-      echo "⚠️  SSH_AUTH_SOCK not set; no ssh-agent detected. Skipping ssh-add -D."
-    fi
-  
 
 # Set the repo to use this key (keep ~/.ssh/config honored; do NOT add -F /dev/null)
 if (( IN_GIT_REPO )); then
-  git config core.sshCommand "ssh -i $SELECTED"
+  git config core.sshCommand "ssh -i $SELECTED -o IdentitiesOnly=yes"
   echo "✅ core.sshCommand set to use key: $SELECTED"
 else
-  echo "ℹ️  Not in a Git repo; skipped setting core.sshCommand. Selected key: $SELECTED"
+  git config --global core.sshCommand "ssh -i $SELECTED -o IdentitiesOnly=yes"
+  echo "✅ global core.sshCommand set to use key: $SELECTED"
+  echo "ℹ️  Run 'git config --global --unset core.sshCommand' to revert."
 fi
 SELECTED_PATH="$SELECTED"
+
+# Update the default Host github.com IdentityFile in ~/.ssh/config so git@github.com: URLs use the selected key
+if [[ -f "$CONFIG" ]] && grep -q "^Host github\.com" "$CONFIG"; then
+  cp -p "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  awk -v key="$SELECTED" '
+    /^Host[[:space:]]+github\.com[[:space:]]*$/ { in_block=1 }
+    in_block && /^Host[[:space:]]+/ && !/^Host[[:space:]]+github\.com[[:space:]]*$/ { in_block=0 }
+    in_block && /^[[:space:]]*IdentityFile[[:space:]]+/ { print "  IdentityFile " key; next }
+    { print }
+  ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  echo "✅ Updated Host github.com in ~/.ssh/config to use: $SELECTED"
+fi
+
+# On macOS, add key to Keychain so passphrase is stored and key loads automatically
+if [[ "$(uname)" == "Darwin" ]] && command -v ssh-add >/dev/null 2>&1; then
+  echo "🔑 Adding key to macOS Keychain..."
+  if ssh-add --apple-use-keychain "$SELECTED" 2>/dev/null; then
+    echo "✅ Key added to Keychain."
+  else
+    echo "⚠️  Could not add to Keychain (wrong passphrase or key has no passphrase)."
+  fi
+fi
+
+echo
+echo "🔌 Testing connection with selected key..."
+TEST_OUT=$(ssh -i "$SELECTED" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T git@github.com 2>&1 </dev/null || true)
+if echo "$TEST_OUT" | grep -q "successfully authenticated"; then
+  GITHUB_USER=$(echo "$TEST_OUT" | grep -o "Hi [^!]*" | cut -d' ' -f2)
+  echo "✅ Authenticated to GitHub as: ${GITHUB_USER}"
+else
+  echo "⚠️  GitHub auth failed or key not registered. Output:"
+  echo "$TEST_OUT"
+fi
 
 # Optionally clear all identities from the ssh-agent (ssh-add -D)
 if (( DO_CLEAR )); then
